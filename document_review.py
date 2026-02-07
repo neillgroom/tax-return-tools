@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Python / Anaconda is located at: C:\Users\ngroom\AppData\Local\anaconda3\python.exe
 """
 Document Review & PDF Combiner
 ==============================
@@ -87,12 +88,31 @@ def classify_by_content(text):
     text_upper = text.upper()
 
     # Check for specific form types in content
-    if 'WAGE AND TAX STATEMENT' in text_upper or 'FORM W-2' in text_upper:
-        # Extract employer name
+    is_w2 = ('WAGE AND TAX STATEMENT' in text_upper or 'FORM W-2' in text_upper or
+             'WAGES, TIPS' in text_upper or 'W-2 WAGE' in text_upper)
+    # Compact W-2 detection: EIN followed by two dollar amounts (no form labels)
+    if not is_w2:
+        is_w2 = bool(re.search(r'\d{2}-\d{7}\s*\n\s*[\d,]+\.\d{2}\s+[\d,]+\.\d{2}', text))
+
+    if is_w2:
+        # Extract employer name - try multiple patterns
         payer = ""
-        emp_match = re.search(r"[Ee]mployer'?s?\s+name[:\s]*\n?\s*([A-Z][A-Za-z0-9\s\.,&-]+)", text)
-        if emp_match:
-            payer = emp_match.group(1).strip()[:40]
+        emp_patterns = [
+            r"[Ee]mployer'?s?\s+name[:\s]*\n?\s*([A-Z][A-Za-z0-9\s\.,&-]+)",
+            r"c\s+[Ee]mployer'?s?\s+name.*?\n\s*([A-Z][A-Za-z0-9\s\.,&-]+)",
+            # Compact format: after SSN, before dollar amounts
+            r'[\dX]{3}-[\dX]{2}-\d{4}\s*\n\s*([A-Z][A-Z0-9&\s\.,]+?)\s+[\d,]+\.\d{2}',
+            # LLC/INC/CORP in text
+            r'^([A-Z][A-Za-z0-9\s\.,&]+?(?:LLC|INC|CORP|L\.L\.C\.|ENTERPRISES)[A-Za-z\s\.]*)',
+        ]
+        for pattern in emp_patterns:
+            emp_match = re.search(pattern, text, re.MULTILINE)
+            if emp_match:
+                name = emp_match.group(1).strip()[:40]
+                # Filter garbage names containing dollar amounts or form text
+                if not re.search(r'\d+\.\d{2}', name) and len(name) > 3:
+                    payer = name
+                    break
         return ('W-2', payer, 1)
 
     # For consolidated 1099s (Vanguard/Fidelity), check which section has actual values
@@ -192,7 +212,7 @@ def classify_by_content(text):
         payer = extract_payer_from_text(text)
         return ('1099-MISC', payer, 8)
 
-    if '1099-G' in text_upper or 'GOVERNMENT PAYMENTS' in text_upper:
+    if '1099-G' in text_upper or 'GOVERNMENT PAYMENTS' in text_upper or 'UNEMPLOYMENT COMPENSATION' in text_upper:
         payer = extract_payer_from_text(text)
         return ('1099-G', payer, 8)
 
@@ -213,6 +233,24 @@ def extract_payer_from_text(text):
     """Extract payer/institution name from document text."""
     import re
 
+    # Garbage words that indicate we matched form instructions, not a name
+    garbage_words = ['zip', 'foreign', 'postal', 'telephone', 'province', 'omb',
+                     'payer', 'form ', 'instructions', 'copy b', 'recipient']
+
+    # Try form-header patterns first (most reliable)
+    header_patterns = [
+        # After "1099-INT\n" or "1099-DIV\n" header
+        r'1099-(?:INT|DIV|R|NEC|G)\s*\n\s*([A-Z][A-Za-z0-9\s\.,&-]+?)(?:\s+Form|\s+\d|\n)',
+        # First line: institution name (CAPITAL ONE N.A., VANGUARD MARKETING, etc.)
+        r'^([A-Z][A-Z\s\.,]+(?:N\.A\.|BANK|SAVINGS|CREDIT UNION|FINANCIAL|INC|LLC|CORP)\.?)',
+    ]
+    for pattern in header_patterns:
+        match = re.search(pattern, text, re.MULTILINE)
+        if match:
+            name = match.group(1).strip()[:40]
+            if not any(bad in name.lower() for bad in garbage_words) and len(name) > 3:
+                return name
+
     # Common patterns for payer names
     patterns = [
         r"PAYER'?S?\s+NAME[:\s]*\n?\s*([A-Z][A-Za-z0-9\s\.,&-]+)",
@@ -222,6 +260,7 @@ def extract_payer_from_text(text):
         r"(SCHWAB[A-Z\s]*)",
         r"(WELLS FARGO[A-Z\s]*)",
         r"(BANK OF AMERICA[A-Z\s]*)",
+        r"(CAPITAL ONE[A-Z\s\.]*)",
         r"(MORGAN STANLEY[A-Z\s]*)",
         r"(TD AMERITRADE[A-Z\s]*)",
         r"(E\*?TRADE[A-Z\s]*)",
@@ -231,7 +270,9 @@ def extract_payer_from_text(text):
     for pattern in patterns:
         match = re.search(pattern, text_upper)
         if match:
-            return match.group(1).strip()[:40]
+            name = match.group(1).strip()[:40]
+            if not any(bad in name.lower() for bad in garbage_words):
+                return name
 
     return ""
 
@@ -311,18 +352,77 @@ def classify_pdf(filename, pdf_path=None):
     return ('Other', payer, 9)
 
 
+def detect_multi_form_contents(pdf_path):
+    """For multi-form PDFs, detect what form types are inside."""
+    if not PDFPLUMBER_AVAILABLE:
+        return []
+
+    try:
+        forms_found = {}  # {form_type: count}
+        seen_eins = {}    # {ein: form_type} to avoid double-counting copies
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                if len(text.strip()) < 50:
+                    continue
+
+                text_upper = text.upper()
+                ein_match = re.search(r'(\d{2}-\d{7})', text)
+                ein = ein_match.group(1) if ein_match else None
+
+                # Determine form type for this page
+                form_type = None
+                if '1099-G' in text_upper or 'UNEMPLOYMENT COMPENSATION' in text_upper:
+                    form_type = '1099-G'
+                elif '1099-NEC' in text_upper or 'NONEMPLOYEE COMPENSATION' in text_upper:
+                    form_type = '1099-NEC'
+                elif ('WAGE AND TAX' in text_upper or 'FORM W-2' in text_upper or
+                      'WAGES, TIPS' in text_upper or
+                      bool(re.search(r'\d{2}-\d{7}\s*\n\s*[\d,]+\.\d{2}\s+[\d,]+\.\d{2}', text))):
+                    form_type = 'W-2'
+
+                if form_type and ein:
+                    key = (ein, form_type)
+                    if key not in seen_eins:
+                        seen_eins[key] = True
+                        forms_found[form_type] = forms_found.get(form_type, 0) + 1
+
+        return [(ft, count) for ft, count in forms_found.items()]
+    except Exception:
+        return []
+
+
 def sort_pdfs_by_category(pdf_files):
     """Sort PDF files by tax form category, reading content when needed."""
     categorized = []
+    multi_form_details = {}  # {pdf_path: [(form_type, count)]}
     print("  Analyzing document contents...")
 
     for pdf_path in pdf_files:
         category, payer, priority = classify_pdf(pdf_path.name, pdf_path)
+
+        # Check for multi-form PDFs (e.g., "all W2.pdf" with multiple forms inside)
+        if category == 'W-2' and PDFPLUMBER_AVAILABLE:
+            try:
+                with pdfplumber.open(pdf_path) as pdf:
+                    if len(pdf.pages) > 5:
+                        # Large PDF - check for multiple form types
+                        text = ""
+                        for page in pdf.pages[:20]:
+                            text += (page.extract_text() or "") + "\n"
+                        eins = set(re.findall(r'\d{2}-\d{7}', text))
+                        if len(eins) > 1:
+                            contents = detect_multi_form_contents(pdf_path)
+                            if contents:
+                                multi_form_details[str(pdf_path)] = contents
+            except Exception:
+                pass
+
         categorized.append((priority, category, payer, pdf_path))
 
     # Sort by priority, then by filename
     categorized.sort(key=lambda x: (x[0], x[3].name.lower()))
-    return categorized
+    return categorized, multi_form_details
 
 
 # =============================================================================
@@ -584,7 +684,7 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
     print()
 
     # Classify and sort PDFs
-    categorized = sort_pdfs_by_category(pdf_files)
+    categorized, multi_form_details = sort_pdfs_by_category(pdf_files)
 
     # Print categorization and build found_docs dict
     print("\nDocument Classification:")
@@ -603,6 +703,18 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
         found_docs[category].append((pdf_path.name, payer))
         payer_str = f" ({payer})" if payer else ""
         print(f"    - {pdf_path.name}{payer_str}")
+        # Show multi-form contents if detected
+        contents = multi_form_details.get(str(pdf_path))
+        if contents:
+            forms_desc = ", ".join(f"{count}x {ft}" for ft, count in contents)
+            print(f"      ^ Multi-form PDF contains: {forms_desc}")
+            # Add sub-forms to found_docs for Google Sheet matching
+            for ft, count in contents:
+                if ft != category:
+                    found_categories.add(ft)
+                    if ft not in found_docs:
+                        found_docs[ft] = []
+                    found_docs[ft].append((pdf_path.name, f"(inside {pdf_path.name})"))
     print()
 
     # Combine PDFs - client_name_year_document_review.pdf
@@ -611,9 +723,13 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
 
     print(f"Combining PDFs...")
     sorted_pdfs = [pdf_path for _, _, _, pdf_path in categorized]
-    combine_pdfs(sorted_pdfs, output_path)
-    print(f"  Created: {output_path}")
-    print(f"  Size: {output_path.stat().st_size / 1024:.1f} KB")
+    try:
+        combine_pdfs(sorted_pdfs, output_path)
+        print(f"  Created: {output_path}")
+        print(f"  Size: {output_path.stat().st_size / 1024:.1f} KB")
+    except PermissionError:
+        print(f"  WARNING: Could not write {output_path} (file may be open)")
+        print(f"  Close the file and rerun, or output will be skipped.")
     print()
 
     # Check against Google Sheet if provided

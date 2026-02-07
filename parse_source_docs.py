@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Python / Anaconda is located at: C:\Users\ngroom\AppData\Local\anaconda3\python.exe
 """
 Source Document Parser
 ======================
@@ -106,6 +107,19 @@ def extract_text_with_ocr(pdf_path):
         print(f"  OCR error: {e}")
 
     return text
+
+
+def extract_text_per_page(pdf_path):
+    """Extract text from each page of a PDF separately."""
+    pages = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                text = page.extract_text() or ""
+                pages.append(text)
+    except Exception as e:
+        print(f"  Warning: Could not read {pdf_path}: {e}")
+    return pages
 
 
 def extract_amount(text, patterns, default=0):
@@ -460,33 +474,48 @@ def parse_w2(text, filename, is_ocr=False):
     # Format B: Labels followed by EIN then values
     #   "1 Wages... 2 Federal..."
     #   "92-3246447 28665.38 251.85"
+    # Format C (Cast&Crew compact): No labels, EIN then values
+    #   "95-4774804"
+    #   "10500.00 1451.00"
 
     # Box 1 & 2: Try multiple patterns
-    # Pattern 1: Values on line immediately after labels (no EIN)
+    # Pattern 1: EIN followed by values (most specific, try first)
     box12_match = re.search(
-        r'1\s+[Ww]ages.*?2\s+[Ff]ederal.*?withheld\s*[\n\r]+([\d,]+\.?\d{2})\s+([\d,]+\.?\d{2})',
+        r'1\s+[Ww]ages.*?2\.?\s+[Ff]ederal.*?[\n\r]+[\d-]+\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
         text, re.DOTALL
     )
     if not box12_match:
-        # Pattern 2: EIN followed by values
+        # Pattern 2: Values on line immediately after labels (no EIN, e.g., Justworks)
         box12_match = re.search(
-            r'1\s+[Ww]ages.*?2\s+[Ff]ederal.*?[\n\r]+[\d-]+\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
+            r'1\s+[Ww]ages.*?2\.?\s+[Ff]ederal.*?withheld\s*[\n\r]+([\d,]+\.?\d{2})\s+([\d,]+\.?\d{2})',
             text, re.DOTALL
         )
-    if box12_match:
+    if not box12_match:
+        # Pattern 3: Compact format - EIN on its own line, then BOX1 BOX2 on next line
+        compact12 = re.search(
+            r'(\d{2}-\d{7})\s*\n\s*([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*\n'
+            r'\s*[\dX]{3}-[\dX]{2}-\d{4}',
+            text
+        )
+        if compact12:
+            box12_match = compact12
+            # Groups are shifted: group(2) = wages, group(3) = fed WH
+            data['box1_wages'] = float(compact12.group(2).replace(',', ''))
+            data['box2_fed_withholding'] = float(compact12.group(3).replace(',', ''))
+    if box12_match and data['box1_wages'] == 0:
         data['box1_wages'] = float(box12_match.group(1).replace(',', ''))
         data['box2_fed_withholding'] = float(box12_match.group(2).replace(',', ''))
 
     # Box 3 & 4: SS wages and SS tax
     # Pattern 1: Values on line immediately after labels
     box34_match = re.search(
-        r'3\s+[Ss]ocial\s+[Ss]ecurity\s+[Ww]ages.*?4\s+[Ss]ocial\s+[Ss]ecurity\s+[Tt]ax.*?withheld\s*[\n\r]+([\d,]+\.?\d{2})\s+([\d,]+\.?\d{2})',
+        r'3\.?\s+[Ss]ocial\s+[Ss]ecurity\s+[Ww]ages.*?4\.?\s+[Ss]ocial\s+[Ss]ecurity\s+[Tt]ax.*?withheld\s*[\n\r]+([\d,]+\.?\d{2})\s+([\d,]+\.?\d{2})',
         text, re.DOTALL
     )
     if not box34_match:
         # Pattern 2: With employer name or other text between
         box34_match = re.search(
-            r'3\s+[Ss]ocial\s+[Ss]ecurity\s+[Ww]ages.*?4\s+[Ss]ocial\s+[Ss]ecurity\s+[Tt]ax.*?[\n\r]+([A-Z][A-Za-z\s]+)?[\n\r]*([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
+            r'3\.?\s+[Ss]ocial\s+[Ss]ecurity\s+[Ww]ages.*?4\.?\s+[Ss]ocial\s+[Ss]ecurity\s+[Tt]ax.*?[\n\r]+([A-Z][A-Za-z\s]+)?[\n\r]*([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
             text, re.DOTALL
         )
         if box34_match:
@@ -499,24 +528,47 @@ def parse_w2(text, filename, is_ocr=False):
     # Box 5 & 6: Medicare wages and tax
     # Pattern 1: Values on line immediately after labels (Justworks format - no EIN prefix)
     box56_match = re.search(
-        r'5\s+[Mm]edicare\s+[Ww]ages.*?6\s+[Mm]edicare\s+[Tt]ax.*?withheld\s*[\n\r]+([\d,]+\.?\d{2})\s+([\d,]+\.?\d{2})',
+        r'5\.?\s+[Mm]edicare\s+[Ww]ages.*?6\.?\s+[Mm]edicare\s+[Tt]ax.*?withheld\s*[\n\r]+([\d,]+\.?\d{2})\s+([\d,]+\.?\d{2})',
         text, re.DOTALL
     )
     if not box56_match:
         # Pattern 2: EIN followed by values (Rippling format)
         box56_match = re.search(
-            r'5\s+[Mm]edicare\s+[Ww]ages.*?6\s+[Mm]edicare\s+[Tt]ax.*?[\n\r]+[\d-]+\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
+            r'5\.?\s+[Mm]edicare\s+[Ww]ages.*?6\.?\s+[Mm]edicare\s+[Tt]ax.*?[\n\r]+[\d-]+\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
             text, re.DOTALL
         )
     if not box56_match:
         # Pattern 3: Generic fallback - values on next line
         box56_match = re.search(
-            r'5\s+[Mm]edicare\s+[Ww]ages.*?6\s+[Mm]edicare\s+[Tt]ax.*?[\n\r]+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
+            r'5\.?\s+[Mm]edicare\s+[Ww]ages.*?6\.?\s+[Mm]edicare\s+[Tt]ax.*?[\n\r]+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)',
             text, re.DOTALL
         )
     if box56_match:
         data['box5_medicare_wages'] = float(box56_match.group(1).replace(',', ''))
         data['box6_medicare_tax'] = float(box56_match.group(2).replace(',', ''))
+
+    # Compact format fallback for Box 3/4: EMPLOYER_NAME BOX3 BOX4
+    if data['box3_ss_wages'] == 0:
+        compact_34 = re.search(
+            r'[\dX]{3}-[\dX]{2}-\d{4}\s*\n\s*[A-Z][A-Z0-9&\s\.]+?\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})',
+            text
+        )
+        if compact_34:
+            data['box3_ss_wages'] = float(compact_34.group(1).replace(',', ''))
+            data['box4_ss_tax'] = float(compact_34.group(2).replace(',', ''))
+
+    # Compact format fallback for Box 5/6: standalone line with two amounts after address
+    if data['box5_medicare_wages'] == 0 and data['box3_ss_wages'] > 0:
+        # Look for a pair of amounts on a line where first matches SS wages
+        # and second is ~1.45% of first (Medicare rate)
+        all_pairs = re.findall(r'^([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$', text, re.MULTILINE)
+        for val1_s, val2_s in all_pairs:
+            val1 = float(val1_s.replace(',', ''))
+            val2 = float(val2_s.replace(',', ''))
+            if val1 > 0 and 0.012 < val2 / val1 < 0.018:  # Medicare rate ~1.45%
+                data['box5_medicare_wages'] = val1
+                data['box6_medicare_tax'] = val2
+                break
 
     # Validate and correct potential Box 3/4 vs 5/6 mix-ups using tax rate math
     # SS tax rate is 6.2%, Medicare rate is 1.45%
@@ -584,6 +636,28 @@ def parse_w2(text, filename, is_ocr=False):
                 data['employer_name'] = name[:60]
                 break
 
+    # Fallback: Compact format - employer name after SSN, followed by dollar amounts
+    if not data['employer_name']:
+        compact_employer = re.search(
+            r'[\dX]{3}-[\dX]{2}-\d{4}\s*\n\s*([A-Z][A-Z0-9&\s\.,]+?)\s+[\d,]+\.\d{2}',
+            text
+        )
+        if compact_employer:
+            name = compact_employer.group(1).strip()
+            if len(name) > 3:
+                data['employer_name'] = name[:60]
+
+    # Fallback: "c Employer's name, address" then name on same or next line
+    if not data['employer_name']:
+        emp_c = re.search(
+            r'[Cc]\s+[Ee]mployer.?s\s+name.*?\n\s*([A-Z][A-Za-z0-9\s\.,&-]+?)(?:\s*\n|\s+\d)',
+            text
+        )
+        if emp_c:
+            name = emp_c.group(1).strip()
+            if len(name) > 3 and not any(bad in name.lower() for bad in ['wages', 'social', 'medicare', 'federal', 'withheld']):
+                data['employer_name'] = name[:60]
+
     # Fallback: look for LLC/INC/CORP in text
     if not data['employer_name']:
         company_match = re.search(r'([A-Z][A-Z0-9\s&-]+(?:LLC|INC|CORP|COMPANY|CO\.))', text)
@@ -640,20 +714,33 @@ def parse_1099int(text, filename, is_ocr=False):
     }
 
     payer_patterns = [
+        # Name after 1099-INT form header (e.g., "1099-INT\nCAPITAL ONE N.A. Form")
+        r"1099-INT\s*\n\s*([A-Z][A-Za-z0-9\s\.,&-]+?)(?:\s+Form|\s+\d|\n)",
+        # First line of text - institution name at top of document
+        r"^([A-Z][A-Z\s\.,]+(?:N\.A\.|BANK|SAVINGS|CREDIT UNION|FINANCIAL|INC|LLC|CORP)\.?)",
+        # Standard patterns
         r"[Pp]ayer'?s?\s+name.*?\n\s*([A-Z][A-Za-z0-9\s\.,&-]+)",
         r"PAYER.*?\n([A-Z][A-Za-z0-9\s\.,&-]+)",
         # Vanguard format
         r"(VANGUARD\s+(?:MARKETING|BROKERAGE)[A-Z\s]*)",
     ]
     for pattern in payer_patterns:
-        match = re.search(pattern, text)
+        match = re.search(pattern, text, re.MULTILINE)
         if match:
-            data['payer_name'] = match.group(1).strip()[:50]
+            name = match.group(1).strip()[:50]
+            # Filter out form instruction text that gets captured
+            if any(bad in name.lower() for bad in ['zip', 'foreign', 'postal', 'telephone', 'province', 'omb', 'payer']):
+                continue
+            data['payer_name'] = name
             break
 
     data['box1_interest'], q1 = extract_amount_with_quality(text, [
+        # Amount with $ sign on same line after Interest income (most reliable)
+        r'[Ii]nterest\s+[Ii]ncome[^$\n]*\$([\d,]+\.\d{2})',
+        # Amount with $ sign on next line after Interest income
+        r'[Ii]nterest\s+[Ii]ncome[^\n]*\n[^\n]*\$([\d,]+\.\d{2})',
         # Vanguard consolidated format: "1- Interest income 123.45"
-        r'1-?\s*[-:]?\s*[Ii]nterest\s+[Ii]ncome[^0-9]*([\d,]+\.?\d*)',
+        r'1-?\s*[-:]?\s*[Ii]nterest\s+[Ii]ncome\s+([\d,]+\.?\d*)',
         r'[Bb]ox\s*1[:\s]+\$?([\d,]+\.?\d*)',
         r'1\s+[Ii]nterest\s+[Ii]ncome\s+\$?([\d,]+\.?\d*)',
     ], 'box1_interest')
@@ -1281,6 +1368,113 @@ def parse_consolidated_1099(text, filename):
     return results
 
 
+def parse_multi_form_pdf(pdf_path, filename):
+    """
+    Parse a PDF containing multiple tax forms (e.g., 'all W2' documents).
+    Splits by page, identifies forms by EIN, deduplicates copies.
+    Returns list of (form_type, data_dict) tuples.
+    """
+    results = []
+    # Per-form-type EIN tracking (same EIN can appear on W-2 AND 1099-NEC from same employer)
+    seen_w2_eins = set()
+    seen_g_eins = set()
+    seen_nec_eins = set()
+    pages = extract_text_per_page(pdf_path)
+
+    for page_num, text in enumerate(pages, 1):
+        if len(text.strip()) < 50:
+            continue
+
+        text_upper = text.upper()
+
+        # Find EIN on this page
+        ein_match = re.search(r'(\d{2}-\d{7})', text)
+        ein = ein_match.group(1) if ein_match else None
+
+        # Check for 1099-G (unemployment) - check first since it's distinctive
+        if '1099-G' in text_upper or 'UNEMPLOYMENT COMPENSATION' in text_upper:
+            if ein and ein in seen_g_eins:
+                continue
+            if ein:
+                seen_g_eins.add(ein)
+            amt_match = re.search(r'[Uu]nemployment\s+compensation\s*\n?\s*\$?\s*([\d,]+\.?\d{2})', text)
+            if not amt_match:
+                amt_match = re.search(r'\$\s*([\d,]+\.\d{2}).*?1099-G', text, re.DOTALL)
+            if amt_match:
+                payer = ''
+                payer_match = re.search(r'^([A-Z][A-Z\s]+(?:DEPARTMENT|LABOR|EMPLOYMENT))', text, re.MULTILINE)
+                if payer_match:
+                    payer = payer_match.group(1).strip()[:50]
+                g_data = {
+                    'description': 'Unemployment Compensation',
+                    'payer_name': payer,
+                    'box1_unemployment': float(amt_match.group(1).replace(',', '')),
+                    'source_file': f"{filename} (pg{page_num})"
+                }
+                results.append(('1099-G', g_data))
+                print(f"    1099-G pg{page_num}: {payer[:30]} - ${g_data['box1_unemployment']:,.2f}")
+                continue
+
+        # Check for 1099-NEC (nonemployee compensation) - check before W-2 since same EIN may appear
+        if '1099-NEC' in text_upper or 'NONEMPLOYEE COMPENSATION' in text_upper:
+            if ein and ein in seen_nec_eins:
+                continue
+            # Extract amount - try with $, then without
+            nec_match = re.search(r'[Nn]onemployee\s+[Cc]ompensation.*?\$\s*([\d,]+\.?\d{2})', text, re.DOTALL)
+            if not nec_match:
+                nec_match = re.search(r'[Nn]onemployee\s+[Cc]ompensation\s*\n\s*([\d,]+\.\d{2})', text)
+            if not nec_match:
+                nec_match = re.search(r'1\s+[Nn]onemployee\s+[Cc]ompensation\s+([\d,]+\.?\d{2})', text)
+            if nec_match:
+                if ein:
+                    seen_nec_eins.add(ein)
+                payer = ''
+                payer_match = re.search(r"[Pp]ayer'?s?\s+name.*?\n\s*([A-Z][A-Za-z0-9\s\.,&-]+)", text)
+                if not payer_match:
+                    payer_match = re.search(r'^([A-Z][A-Za-z0-9\s\.,&-]+(?:LLC|INC|CORP|DBA\s+\w+))', text, re.MULTILINE)
+                if payer_match:
+                    payer = payer_match.group(1).strip()[:50]
+                nec_data = {
+                    'payer_name': payer,
+                    'box1_nonemployee_comp': float(nec_match.group(1).replace(',', '')),
+                    'source_file': f"{filename} (pg{page_num})"
+                }
+                results.append(('1099-NEC', nec_data))
+                print(f"    1099-NEC pg{page_num}: {payer[:30]} - ${nec_data['box1_nonemployee_comp']:,.2f}")
+                continue
+
+        # Check for W-2 indicators
+        is_w2 = ('WAGE AND TAX' in text_upper or 'FORM W-2' in text_upper or
+                  'WAGES, TIPS' in text_upper or 'W-2 WAGE' in text_upper or
+                  ('EMPLOYER' in text_upper and re.search(r'[\d,]+\.\d{2}\s+[\d,]+\.\d{2}', text)))
+
+        # Compact W-2 detection: EIN line followed by two dollar amounts (wages + fed withholding)
+        if not is_w2 and ein:
+            has_compact_w2 = bool(re.search(
+                r'\d{2}-\d{7}\s*\n\s*[\d,]+\.\d{2}\s+[\d,]+\.\d{2}',
+                text))
+            is_w2 = has_compact_w2
+
+        if is_w2 and ein:
+            if ein in seen_w2_eins:
+                continue
+            seen_w2_eins.add(ein)
+            page_label = f"{filename} (pg{page_num})"
+            data = parse_w2(text, page_label)
+            if data.get('box1_wages', 0) > 0:
+                # Sanity check: reject entries where employer name contains dollar amounts
+                # (indicates earnings summary page, not actual W-2)
+                emp_name = data.get('employer_name', '')
+                if re.search(r'\d+\.\d{2}', emp_name):
+                    print(f"    Skipped pg{page_num}: earnings summary (not a W-2)")
+                    continue
+                results.append(('W-2', data))
+                print(f"    W-2 pg{page_num}: {data.get('employer_name', '?')[:30]} - ${data.get('box1_wages', 0):,.2f}")
+                continue
+
+    return results
+
+
 def parse_folder(folder_path):
     """Parse all PDFs in a folder and return structured data."""
     folder = Path(folder_path)
@@ -1294,7 +1488,8 @@ def parse_folder(folder_path):
             'source_folder': str(folder),
             'parse_date': datetime.now().isoformat(),
             'files_processed': 0,
-            'files_skipped': 0
+            'files_skipped': 0,
+            'skipped_files': []
         },
         'forms': {
             'W-2': [],
@@ -1322,11 +1517,10 @@ def parse_folder(folder_path):
 
         text, is_scanned = extract_text_from_pdf(pdf_path)
         if not text.strip():
-            if OCR_AVAILABLE:
-                print(f"  Skipped: OCR failed to extract text")
-            else:
-                print(f"  Skipped: Scanned document (install pytesseract & pdf2image for OCR)")
+            reason = "OCR failed to extract text" if OCR_AVAILABLE else "Scanned document (no OCR)"
+            print(f"  Skipped: {reason}")
             results['metadata']['files_skipped'] += 1
+            results['metadata']['skipped_files'].append({'file': filename, 'reason': reason})
             continue
 
         if is_scanned:
@@ -1336,8 +1530,30 @@ def parse_folder(folder_path):
         print(f"  Identified as: {doc_type}")
 
         if doc_type == 'W-2':
+            # Check if this is a multi-form PDF (multiple unique EINs)
+            eins = set(re.findall(r'\d{2}-\d{7}', text))
+            if len(eins) > 1:
+                print(f"  Multi-form PDF detected ({len(eins)} unique EINs)")
+                multi_results = parse_multi_form_pdf(pdf_path, filename)
+                if multi_results:
+                    for form_type, data in multi_results:
+                        if '_quality' not in data:
+                            data = add_quality_metadata(data, form_type, is_scanned)
+                        if form_type == 'W-2':
+                            results['forms']['W-2'].append(data)
+                        elif form_type == '1099-G':
+                            if '1099-G' not in results['forms']:
+                                results['forms']['1099-G'] = []
+                            results['forms']['1099-G'].append(data)
+                        elif form_type == '1099-NEC':
+                            if '1099-NEC' not in results['forms']:
+                                results['forms']['1099-NEC'] = []
+                            results['forms']['1099-NEC'].append(data)
+                    results['metadata']['files_processed'] += 1
+                    continue
+
+            # Single W-2
             data = parse_w2(text, filename, is_ocr=is_scanned)
-            # Add quality metadata if not already present
             if '_quality' not in data:
                 data = add_quality_metadata(data, 'W-2', is_scanned, ['employer_name', 'box1_wages'])
             results['forms']['W-2'].append(data)
@@ -1444,6 +1660,7 @@ def parse_folder(folder_path):
         else:
             print(f"  Skipped: Unknown document type")
             results['metadata']['files_skipped'] += 1
+            results['metadata']['skipped_files'].append({'file': filename, 'reason': 'Unknown document type'})
             continue
 
         results['metadata']['files_processed'] += 1
@@ -1500,6 +1717,13 @@ Examples:
     for form_type, entries in results['forms'].items():
         if entries:
             print(f"  {form_type}: {len(entries)}")
+
+    if results['metadata']['skipped_files']:
+        print()
+        print("Skipped files (review manually):")
+        for skip in results['metadata']['skipped_files']:
+            print(f"  - {skip['file']} ({skip['reason']})")
+
     print()
     print(f"JSON saved to: {output_path}")
 
