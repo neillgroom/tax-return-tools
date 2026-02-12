@@ -574,6 +574,10 @@ def classify_by_content(text):
         payer = extract_payer_from_text(text)
         return ('1099-R', payer, 4)
 
+    if '1099-SA' in text_upper or 'DISTRIBUTIONS FROM AN HSA' in text_upper or 'HEALTH SAVINGS ACCOUNT' in text_upper:
+        payer = extract_payer_from_text(text)
+        return ('1099-SA', payer, 8)
+
     if 'SSA-1099' in text_upper or 'SOCIAL SECURITY BENEFIT' in text_upper:
         return ('SSA-1099', 'Social Security Admin', 5)
 
@@ -614,6 +618,27 @@ def classify_by_content(text):
 
     if 'PROPERTY TAX' in text_upper or 'AD VALOREM' in text_upper or 'TAX COLLECTOR' in text_upper:
         return ('Property Tax', '', 9)
+
+    # Unlabeled bank/credit union interest statements
+    # Detect by: financial institution keywords + EIN + dollar amounts
+    has_bank_keywords = bool(re.search(
+        r'BANK|CREDIT UNION|FCU|SAVINGS|N\.A\.|FEDERAL SAVINGS|TRUST COMPANY',
+        text_upper
+    ))
+    has_ein = bool(re.search(r'\d{2}-\d{7}', text))
+    has_dollar_amounts = bool(re.search(r'\d+\.\d{2}', text))
+    # Make sure it's not already a known form type (no form labels present)
+    has_form_labels = bool(re.search(r'FORM\s+\d{4}|W-2|1099|1098|K-1', text_upper))
+    if has_bank_keywords and has_ein and has_dollar_amounts and not has_form_labels:
+        payer = extract_payer_from_text(text)
+        # Try to extract institution name from first few lines
+        if not payer:
+            for line in text.split('\n')[:10]:
+                line = line.strip()
+                if re.search(r'BANK|CREDIT UNION|FCU|SAVINGS|N\.A\.', line.upper()) and len(line) > 5:
+                    payer = line.strip()[:40]
+                    break
+        return ('1099-INT', payer, 2)
 
     return (None, '', 99)
 
@@ -698,6 +723,10 @@ def classify_pdf(filename, pdf_path=None):
     # 1099-B / Brokerage (priority 6)
     if '1099-B' in fname_upper or '1099B' in fname_upper:
         return ('1099-B', payer, 6)
+
+    # 1099-SA (priority 8 - HSA)
+    if '1099-SA' in fname_upper or '1099SA' in fname_upper:
+        return ('1099-SA', payer, 8)
 
     # 1099-Q (priority 8 - education)
     if '1099-Q' in fname_upper or '1099Q' in fname_upper:
