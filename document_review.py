@@ -28,8 +28,11 @@ import sys
 from pathlib import Path
 from datetime import datetime
 
+NORMALIZE_AVAILABLE = False
 try:
-    from pypdf import PdfReader, PdfWriter
+    from pypdf import PdfReader, PdfWriter, Transformation
+    from pypdf.generic import RectangleObject
+    NORMALIZE_AVAILABLE = True
 except ImportError:
     try:
         from PyPDF2 import PdfReader, PdfWriter
@@ -43,6 +46,25 @@ try:
 except ImportError:
     PDFPLUMBER_AVAILABLE = False
 
+try:
+    from PIL import Image, ImageFilter
+    PIL_AVAILABLE = True
+except ImportError:
+    PIL_AVAILABLE = False
+
+try:
+    import pillow_heif
+    pillow_heif.register_heif_opener()
+    HEIF_AVAILABLE = True
+except ImportError:
+    HEIF_AVAILABLE = False
+
+# Supported image extensions for conversion
+IMAGE_EXTENSIONS = {'.heic', '.heif', '.jpg', '.jpeg', '.png', '.tiff', '.tif', '.bmp', '.webp'}
+
+# Supported Office extensions for conversion
+OFFICE_EXTENSIONS = {'.xlsx', '.xls', '.docx', '.doc', '.csv'}
+
 # Optional Google Sheets support
 GSHEETS_AVAILABLE = False
 try:
@@ -51,6 +73,361 @@ try:
     GSHEETS_AVAILABLE = True
 except ImportError:
     pass
+
+# Optional win32com for Office file conversion (Windows)
+WIN32COM_AVAILABLE = False
+try:
+    import win32com.client
+    WIN32COM_AVAILABLE = True
+except ImportError:
+    pass
+
+
+# =============================================================================
+# IMAGE TO PDF CONVERSION
+# =============================================================================
+
+# Standard US Letter dimensions at 300 DPI
+LETTER_WIDTH_PX = 2550   # 8.5 inches * 300 DPI
+LETTER_HEIGHT_PX = 3300  # 11 inches * 300 DPI
+
+# Standard US Letter dimensions in points (72 DPI) for PDF normalization
+LETTER_WIDTH_PT = 612.0   # 8.5 inches * 72 points/inch
+LETTER_HEIGHT_PT = 792.0  # 11 inches * 72 points/inch
+
+
+def auto_rotate_image(img):
+    """
+    Auto-rotate image to correct orientation.
+    Handles EXIF orientation tags and detects landscape vs portrait.
+    """
+    # First, apply EXIF orientation (camera rotation metadata)
+    try:
+        from PIL import ExifTags
+        exif = img.getexif()
+        if exif:
+            for tag, value in exif.items():
+                if ExifTags.TAGS.get(tag) == 'Orientation':
+                    if value == 3:
+                        img = img.rotate(180, expand=True)
+                    elif value == 6:
+                        img = img.rotate(270, expand=True)
+                    elif value == 8:
+                        img = img.rotate(90, expand=True)
+                    break
+    except (AttributeError, KeyError, TypeError):
+        pass
+
+    # Tax documents are almost always portrait - rotate landscape images
+    w, h = img.size
+    if w > h * 1.2:  # Significantly wider than tall = landscape
+        img = img.rotate(270, expand=True)
+
+    return img
+
+
+def trim_edges(img, threshold=240, min_border=20):
+    """
+    Trim whitespace and dark borders from photo edges.
+    Detects the document region within the photo.
+    """
+    import numpy as np
+
+    # Convert to grayscale numpy array
+    gray = img.convert('L')
+    arr = np.array(gray)
+
+    # Find rows and columns that have significant content
+    # (not nearly-white background and not black borders)
+    row_means = arr.mean(axis=1)
+    col_means = arr.mean(axis=0)
+
+    # Content rows: not too bright (background) and not too dark (black border)
+    content_rows = np.where((row_means < threshold) & (row_means > 15))[0]
+    content_cols = np.where((col_means < threshold) & (col_means > 15))[0]
+
+    if len(content_rows) < 50 or len(content_cols) < 50:
+        # Not enough content detected, return original
+        return img
+
+    top = max(0, content_rows[0] - min_border)
+    bottom = min(arr.shape[0], content_rows[-1] + min_border)
+    left = max(0, content_cols[0] - min_border)
+    right = min(arr.shape[1], content_cols[-1] + min_border)
+
+    # Only crop if we're removing meaningful borders (at least 2% per side)
+    h, w = arr.shape
+    if (top > h * 0.02 or (h - bottom) > h * 0.02 or
+            left > w * 0.02 or (w - right) > w * 0.02):
+        img = img.crop((left, top, right, bottom))
+
+    return img
+
+
+def scale_to_letter(img):
+    """
+    Scale image to fit US Letter size (8.5x11) while maintaining aspect ratio.
+    Adds white padding to center the document on the page.
+    """
+    w, h = img.size
+
+    # Calculate scale to fit within letter size with small margins
+    margin = 75  # ~0.25 inch margin at 300 DPI
+    max_w = LETTER_WIDTH_PX - 2 * margin
+    max_h = LETTER_HEIGHT_PX - 2 * margin
+
+    scale = min(max_w / w, max_h / h)
+
+    # Only scale down, don't upscale small images beyond 1.5x
+    if scale > 1.5:
+        scale = 1.5
+
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+
+    # Resize with high quality
+    img = img.resize((new_w, new_h), Image.LANCZOS)
+
+    # Create white letter-size canvas and paste centered
+    canvas = Image.new('RGB', (LETTER_WIDTH_PX, LETTER_HEIGHT_PX), 'white')
+    x_offset = (LETTER_WIDTH_PX - new_w) // 2
+    y_offset = (LETTER_HEIGHT_PX - new_h) // 2
+    canvas.paste(img, (x_offset, y_offset))
+
+    return canvas
+
+
+def convert_image_to_pdf(image_path, output_pdf_path):
+    """
+    Convert an image file to a properly oriented, trimmed, and scaled PDF.
+    Returns the output path on success, None on failure.
+    """
+    try:
+        img = Image.open(str(image_path))
+
+        # Convert to RGB if needed (RGBA, P mode, etc.)
+        if img.mode in ('RGBA', 'P', 'LA'):
+            background = Image.new('RGB', img.size, 'white')
+            if img.mode == 'RGBA' or img.mode == 'LA':
+                background.paste(img, mask=img.split()[-1])
+            else:
+                background.paste(img)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        # Step 1: Auto-rotate (EXIF + landscape detection)
+        img = auto_rotate_image(img)
+
+        # Step 2: Trim edges (remove photo borders/background)
+        img = trim_edges(img)
+
+        # Step 3: Scale to letter size with centering
+        img = scale_to_letter(img)
+
+        # Save as PDF
+        img.save(str(output_pdf_path), 'PDF', resolution=300)
+        return output_pdf_path
+
+    except Exception as e:
+        print(f"  WARNING: Could not convert {image_path.name}: {e}")
+        return None
+
+
+def convert_images_in_folder(folder):
+    """
+    Find all image files in folder, convert to PDF.
+    Returns list of newly created PDF paths.
+    """
+    if not PIL_AVAILABLE:
+        return []
+
+    converted = []
+    image_files = []
+
+    for f in folder.iterdir():
+        if f.suffix.lower() in IMAGE_EXTENSIONS:
+            image_files.append(f)
+
+    if not image_files:
+        return []
+
+    # Check HEIF support
+    heic_files = [f for f in image_files if f.suffix.lower() in ('.heic', '.heif')]
+    if heic_files and not HEIF_AVAILABLE:
+        print(f"  WARNING: {len(heic_files)} HEIC files found but pillow-heif not installed")
+        print(f"           Run: pip install pillow-heif")
+        image_files = [f for f in image_files if f.suffix.lower() not in ('.heic', '.heif')]
+
+    if not image_files:
+        return []
+
+    print(f"  Converting {len(image_files)} image(s) to PDF...")
+
+    for img_path in image_files:
+        pdf_path = img_path.with_suffix('.pdf')
+
+        # Skip if PDF already exists and is newer than the image
+        if pdf_path.exists() and pdf_path.stat().st_mtime > img_path.stat().st_mtime:
+            converted.append(pdf_path)
+            continue
+
+        result = convert_image_to_pdf(img_path, pdf_path)
+        if result:
+            print(f"    {img_path.name} -> {pdf_path.name}")
+            converted.append(result)
+
+    return converted
+
+
+# =============================================================================
+# PDF PAGE NORMALIZATION
+# =============================================================================
+
+def normalize_pdf_page(page, auto_rotate=True):
+    """
+    Normalize a PDF page to US Letter (8.5x11).
+    Rotates landscape pages to portrait only if auto_rotate is True.
+    Scales non-letter pages to fit. Preserves vector quality.
+    """
+    if not NORMALIZE_AVAILABLE:
+        return page
+
+    # Transfer /Rotate into content stream so mediabox = visual dimensions
+    try:
+        page.transfer_rotation_to_content()
+    except (AttributeError, Exception):
+        pass
+
+    mb = page.mediabox
+    x0, y0 = float(mb.left), float(mb.bottom)
+    w = float(mb.width)
+    h = float(mb.height)
+
+    # Shift content to origin if mediabox is offset
+    if abs(x0) > 1 or abs(y0) > 1:
+        page.add_transformation(Transformation().translate(-x0, -y0))
+        page.mediabox = RectangleObject([0, 0, w, h])
+
+    # Rotate landscape pages to portrait (only when auto_rotate enabled)
+    if auto_rotate and w > h * 1.05:
+        page.add_transformation(Transformation().rotate(270).translate(0, w))
+        page.mediabox = RectangleObject([0, 0, h, w])
+        w, h = h, w
+
+    # Already letter size? (within ~0.5 inch tolerance)
+    if abs(w - LETTER_WIDTH_PT) < 36 and abs(h - LETTER_HEIGHT_PT) < 36:
+        return page
+
+    # Scale to fit letter with small margin
+    margin_pt = 18  # ~0.25 inch
+    usable_w = LETTER_WIDTH_PT - 2 * margin_pt
+    usable_h = LETTER_HEIGHT_PT - 2 * margin_pt
+    scale = min(usable_w / w, usable_h / h)
+
+    scaled_w = w * scale
+    scaled_h = h * scale
+    tx = (LETTER_WIDTH_PT - scaled_w) / 2
+    ty = (LETTER_HEIGHT_PT - scaled_h) / 2
+
+    page.add_transformation(
+        Transformation().scale(scale, scale).translate(tx, ty)
+    )
+    page.mediabox = RectangleObject([0, 0, LETTER_WIDTH_PT, LETTER_HEIGHT_PT])
+
+    # Remove conflicting box definitions
+    for box in ('/CropBox', '/BleedBox', '/TrimBox', '/ArtBox'):
+        if box in page:
+            try:
+                del page[box]
+            except Exception:
+                pass
+
+    return page
+
+
+# =============================================================================
+# OFFICE FILE CONVERSION
+# =============================================================================
+
+def convert_office_files_in_folder(folder):
+    """
+    Find Word and Excel files in folder, convert to PDF via Office COM automation.
+    Returns list of newly created PDF paths.
+    """
+    if not WIN32COM_AVAILABLE:
+        return []
+
+    office_files = [f for f in folder.iterdir() if f.suffix.lower() in OFFICE_EXTENSIONS]
+    if not office_files:
+        return []
+
+    word_files = [f for f in office_files if f.suffix.lower() in ('.docx', '.doc')]
+    excel_files = [f for f in office_files if f.suffix.lower() in ('.xlsx', '.xls', '.csv')
+                   and 'checksheet' not in f.name.lower()]
+    converted = []
+
+    print(f"  Converting {len(office_files)} Office file(s) to PDF...")
+
+    # Convert Word documents
+    if word_files:
+        try:
+            word = win32com.client.Dispatch('Word.Application')
+            word.Visible = False
+            word.DisplayAlerts = False
+            try:
+                for wp in word_files:
+                    pdf_path = wp.with_suffix('.pdf')
+                    if pdf_path.exists() and pdf_path.stat().st_mtime > wp.stat().st_mtime:
+                        converted.append(pdf_path)
+                        continue
+                    try:
+                        doc = word.Documents.Open(str(wp.resolve()))
+                        doc.SaveAs(str(pdf_path.resolve()), FileFormat=17)
+                        doc.Close(False)
+                        if pdf_path.exists():
+                            print(f"    {wp.name} -> {pdf_path.name}")
+                            converted.append(pdf_path)
+                    except Exception as e:
+                        print(f"    WARNING: Could not convert {wp.name}: {e}")
+            finally:
+                try:
+                    word.Quit()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"    WARNING: Could not start Word: {e}")
+
+    # Convert Excel spreadsheets
+    if excel_files:
+        try:
+            excel = win32com.client.Dispatch('Excel.Application')
+            excel.Visible = False
+            excel.DisplayAlerts = False
+            try:
+                for ep in excel_files:
+                    pdf_path = ep.with_suffix('.pdf')
+                    if pdf_path.exists() and pdf_path.stat().st_mtime > ep.stat().st_mtime:
+                        converted.append(pdf_path)
+                        continue
+                    try:
+                        wb = excel.Workbooks.Open(str(ep.resolve()))
+                        wb.ExportAsFixedFormat(0, str(pdf_path.resolve()))
+                        wb.Close(False)
+                        if pdf_path.exists():
+                            print(f"    {ep.name} -> {pdf_path.name}")
+                            converted.append(pdf_path)
+                    except Exception as e:
+                        print(f"    WARNING: Could not convert {ep.name}: {e}")
+            finally:
+                try:
+                    excel.Quit()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"    WARNING: Could not start Excel: {e}")
+
+    return converted
 
 
 # =============================================================================
@@ -87,12 +464,24 @@ def classify_by_content(text):
     import re
     text_upper = text.upper()
 
-    # Check for specific form types in content
-    is_w2 = ('WAGE AND TAX STATEMENT' in text_upper or 'FORM W-2' in text_upper or
-             'WAGES, TIPS' in text_upper or 'W-2 WAGE' in text_upper)
-    # Compact W-2 detection: EIN followed by two dollar amounts (no form labels)
-    if not is_w2:
-        is_w2 = bool(re.search(r'\d{2}-\d{7}\s*\n\s*[\d,]+\.\d{2}\s+[\d,]+\.\d{2}', text))
+    # Pre-scan: non-W-2 form markers that override W-2 classification
+    NON_W2_FORM_MARKERS = ['5498', '1099-SA', '1095-C', '1095-B',
+                           '1099-MISC', '1099-NEC', '1099-G']
+    has_non_w2_marker = any(marker in text_upper for marker in NON_W2_FORM_MARKERS)
+    has_ss_wages = 'SOCIAL SECURITY WAGES' in text_upper
+
+    # "Social security wages" can ONLY appear on a W-2
+    if has_ss_wages:
+        is_w2 = True
+    elif has_non_w2_marker:
+        is_w2 = False
+    else:
+        # Check for specific form types in content
+        is_w2 = ('WAGE AND TAX STATEMENT' in text_upper or 'FORM W-2' in text_upper or
+                 'WAGES, TIPS' in text_upper or 'W-2 WAGE' in text_upper)
+        # Compact W-2 detection: EIN followed by two dollar amounts (no form labels)
+        if not is_w2:
+            is_w2 = bool(re.search(r'\d{2}-\d{7}\s*\n\s*[\d,]+\.\d{2}\s+[\d,]+\.\d{2}', text))
 
     if is_w2:
         # Extract employer name - try multiple patterns
@@ -392,52 +781,163 @@ def detect_multi_form_contents(pdf_path):
         return []
 
 
-def sort_pdfs_by_category(pdf_files):
-    """Sort PDF files by tax form category, reading content when needed."""
+def classify_pdf_pages(pdf_path):
+    """
+    Classify individual pages of a multi-page PDF to detect mixed form types.
+    Returns list of (page_indices, category, payer, priority) groups,
+    or None if the PDF should be treated as a single document.
+    """
+    if not PDFPLUMBER_AVAILABLE:
+        return None
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            num_pages = len(pdf.pages)
+            if num_pages <= 2:
+                return None
+
+            # Classify each page
+            page_classes = []
+            for i, page in enumerate(pdf.pages):
+                text = page.extract_text() or ""
+                if len(text.strip()) < 50:
+                    page_classes.append((i, None, '', 99))
+                    continue
+                form_type, payer, priority = classify_by_content(text)
+                page_classes.append((i, form_type, payer, priority))
+    except Exception:
+        return None
+
+    # Check if multiple form types exist
+    types_found = set(t[1] for t in page_classes if t[1] is not None)
+    if len(types_found) <= 1:
+        return None  # Single form type, use file-level classification
+
+    # Group consecutive pages by form type
+    groups = []
+    current_pages = [page_classes[0][0]]
+    current_type = page_classes[0][1]
+    current_payer = page_classes[0][2]
+    current_priority = page_classes[0][3]
+
+    for i in range(1, len(page_classes)):
+        idx, form_type, payer, priority = page_classes[i]
+
+        if form_type is None:
+            # Unclassified page - attach to current group
+            current_pages.append(idx)
+        elif form_type == current_type:
+            # Same type - continue group
+            current_pages.append(idx)
+            if payer and not current_payer:
+                current_payer = payer
+        else:
+            # New form type - save current group, start new one
+            groups.append((list(current_pages), current_type or 'Other',
+                          current_payer, current_priority))
+            current_pages = [idx]
+            current_type = form_type
+            current_payer = payer
+            current_priority = priority
+
+    # Save last group
+    groups.append((list(current_pages), current_type or 'Other',
+                  current_payer, current_priority))
+
+    return groups
+
+
+def sort_pdfs_by_category(pdf_files, file_origins=None):
+    """
+    Sort PDF files by tax form category, reading content when needed.
+    Multi-form PDFs are split into separate page groups.
+    Returns list of (priority, category, payer, pdf_path, page_indices) tuples.
+    page_indices is None for whole files, or a list of page numbers for splits.
+    """
+    if file_origins is None:
+        file_origins = {}
     categorized = []
-    multi_form_details = {}  # {pdf_path: [(form_type, count)]}
     print("  Analyzing document contents...")
 
     for pdf_path in pdf_files:
-        category, payer, priority = classify_pdf(pdf_path.name, pdf_path)
+        # Try page-level classification for multi-form detection
+        page_groups = classify_pdf_pages(pdf_path)
 
-        # Check for multi-form PDFs (e.g., "all W2.pdf" with multiple forms inside)
-        if category == 'W-2' and PDFPLUMBER_AVAILABLE:
-            try:
-                with pdfplumber.open(pdf_path) as pdf:
-                    if len(pdf.pages) > 5:
-                        # Large PDF - check for multiple form types
-                        text = ""
-                        for page in pdf.pages[:20]:
-                            text += (page.extract_text() or "") + "\n"
-                        eins = set(re.findall(r'\d{2}-\d{7}', text))
-                        if len(eins) > 1:
-                            contents = detect_multi_form_contents(pdf_path)
-                            if contents:
-                                multi_form_details[str(pdf_path)] = contents
-            except Exception:
-                pass
+        if page_groups and len(page_groups) > 1:
+            # Multi-form PDF - add each group separately
+            group_desc = ", ".join(f"{cat}" for _, cat, _, _ in page_groups)
+            print(f"    Split {pdf_path.name} -> [{group_desc}]")
+            for pages, category, payer, priority in page_groups:
+                if category == 'Other' and file_origins:
+                    origin = file_origins.get(str(pdf_path), 'original')
+                    if origin == 'image':
+                        category = 'Other (Photo)'
+                        priority = 10
+                    elif origin == 'office':
+                        category = 'Other (Office)'
+                        priority = 11
+                categorized.append((priority, category, payer, pdf_path, pages))
+        else:
+            # Single form type or small file - classify whole file
+            category, payer, priority = classify_pdf(pdf_path.name, pdf_path)
 
-        categorized.append((priority, category, payer, pdf_path))
+            if category == 'Other' and file_origins:
+                origin = file_origins.get(str(pdf_path), 'original')
+                if origin == 'image':
+                    category = 'Other (Photo)'
+                    priority = 10
+                elif origin == 'office':
+                    category = 'Other (Office)'
+                    priority = 11
+
+            categorized.append((priority, category, payer, pdf_path, None))
 
     # Sort by priority, then by filename
     categorized.sort(key=lambda x: (x[0], x[3].name.lower()))
-    return categorized, multi_form_details
+    return categorized
 
 
 # =============================================================================
 # PDF COMBINATION
 # =============================================================================
 
-def combine_pdfs(pdf_files, output_path):
-    """Combine multiple PDFs into a single document."""
+def combine_pdfs(categorized, output_path):
+    """
+    Combine PDFs into a single document, normalizing all pages to letter size.
+    Accepts categorized entries with page indices for page-level sorting.
+    Only auto-rotates landscape pages that have no readable text (sideways scans).
+    """
     writer = PdfWriter()
 
-    for pdf_path in pdf_files:
+    for priority, category, payer, pdf_path, page_indices in categorized:
         try:
             reader = PdfReader(str(pdf_path))
-            for page in reader.pages:
-                writer.add_page(page)
+
+            # Determine which pages to include
+            if page_indices is None:
+                pages_to_process = list(range(len(reader.pages)))
+            else:
+                pages_to_process = page_indices
+
+            # Check which pages have extractable text (for rotation decisions)
+            page_has_text = {}
+            if PDFPLUMBER_AVAILABLE:
+                try:
+                    with pdfplumber.open(str(pdf_path)) as plumber:
+                        for i in pages_to_process:
+                            if i < len(plumber.pages):
+                                text = plumber.pages[i].extract_text() or ""
+                                page_has_text[i] = len(text.strip()) > 100
+                except Exception:
+                    pass
+
+            for i in pages_to_process:
+                if i < len(reader.pages):
+                    page = reader.pages[i]
+                    # Don't auto-rotate pages with readable text (intentionally landscape)
+                    has_text = page_has_text.get(i, False)
+                    page = normalize_pdf_page(page, auto_rotate=not has_text)
+                    writer.add_page(page)
         except Exception as e:
             print(f"  WARNING: Could not read {pdf_path.name}: {e}")
             continue
@@ -671,10 +1171,23 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
     print(f"Folder: {folder}")
     print()
 
+    # Convert any image files (HEIC, JPG, etc.) to PDF first
+    converted_images = convert_images_in_folder(folder)
+
+    # Convert any Office files (Word, Excel) to PDF
+    converted_office = convert_office_files_in_folder(folder)
+
+    # Track file origins for sort priority of unidentified docs
+    file_origins = {}
+    for p in converted_images:
+        file_origins[str(p)] = 'image'
+    for p in converted_office:
+        file_origins[str(p)] = 'office'
+
     # Find all PDFs (exclude previously generated combined PDFs)
     pdf_files = list(folder.glob('*.pdf')) + list(folder.glob('*.PDF'))
     pdf_files = list(set(pdf_files))  # Remove duplicates
-    pdf_files = [f for f in pdf_files if '_document_review.pdf' not in f.name.lower()]
+    pdf_files = [f for f in pdf_files if '_document_review' not in f.name.lower()]
 
     if not pdf_files:
         print("No PDF files found!")
@@ -684,7 +1197,7 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
     print()
 
     # Classify and sort PDFs
-    categorized, multi_form_details = sort_pdfs_by_category(pdf_files)
+    categorized = sort_pdfs_by_category(pdf_files, file_origins)
 
     # Print categorization and build found_docs dict
     print("\nDocument Classification:")
@@ -693,7 +1206,7 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
     found_categories = set()
     found_docs = {}  # {category: [(filename, payer)]}
 
-    for priority, category, payer, pdf_path in categorized:
+    for priority, category, payer, pdf_path, page_indices in categorized:
         if category != current_category:
             print(f"\n  [{category}]")
             current_category = category
@@ -702,19 +1215,8 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
             found_docs[category] = []
         found_docs[category].append((pdf_path.name, payer))
         payer_str = f" ({payer})" if payer else ""
-        print(f"    - {pdf_path.name}{payer_str}")
-        # Show multi-form contents if detected
-        contents = multi_form_details.get(str(pdf_path))
-        if contents:
-            forms_desc = ", ".join(f"{count}x {ft}" for ft, count in contents)
-            print(f"      ^ Multi-form PDF contains: {forms_desc}")
-            # Add sub-forms to found_docs for Google Sheet matching
-            for ft, count in contents:
-                if ft != category:
-                    found_categories.add(ft)
-                    if ft not in found_docs:
-                        found_docs[ft] = []
-                    found_docs[ft].append((pdf_path.name, f"(inside {pdf_path.name})"))
+        pages_str = f" (pages {page_indices[0]+1}-{page_indices[-1]+1})" if page_indices else ""
+        print(f"    - {pdf_path.name}{payer_str}{pages_str}")
     print()
 
     # Combine PDFs - client_name_year_document_review.pdf
@@ -722,9 +1224,8 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
     output_path = folder / output_filename
 
     print(f"Combining PDFs...")
-    sorted_pdfs = [pdf_path for _, _, _, pdf_path in categorized]
     try:
-        combine_pdfs(sorted_pdfs, output_path)
+        combine_pdfs(categorized, output_path)
         print(f"  Created: {output_path}")
         print(f"  Size: {output_path.stat().st_size / 1024:.1f} KB")
     except PermissionError:
@@ -744,12 +1245,13 @@ def process_folder(folder_path, google_sheet_id=None, credentials_path=None):
     print("=" * 60)
     print("SUMMARY")
     print("=" * 60)
-    print(f"Documents combined: {len(sorted_pdfs)}")
+    num_entries = len(categorized)
+    print(f"Document groups combined: {num_entries}")
     print(f"Output file: {output_filename}")
     print()
     print("Categories found:")
     for cat in sorted(found_categories):
-        count = len([c for _, c, _, _ in categorized if c == cat])
+        count = len([c for _, c, _, _, _ in categorized if c == cat])
         print(f"  {cat}: {count}")
 
     return output_path
